@@ -1,0 +1,4 @@
+interface:
+  display_name: "Frontend Design"
+  short_description: "Design and implement distinctive, production-grade frontend interfaces without generic template aesthetics"
+  default_prompt: "Use Frontend Design to implement a memorable frontend interface with a clear visual direction while preserving existing product patterns unless a redesign is requested."

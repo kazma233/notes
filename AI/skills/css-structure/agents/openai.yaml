@@ -1,0 +1,4 @@
+interface:
+  display_name: "CSS Structure"
+  short_description: "Organize plain CSS with tokens, layouts, components, and minimal utilities"
+  default_prompt: "Use CSS Structure to organize or migrate frontend styles with semantic HTML and constrained plain CSS."

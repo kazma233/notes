@@ -1,0 +1,10 @@
+services:
+  frps:
+    image: snowdreamtech/frps
+    restart: always
+    ports:
+      - 7000:7000
+      - 7100:7100
+    network_mode: "host"
+    volumes:
+      - ./frp/config:/etc/frp/

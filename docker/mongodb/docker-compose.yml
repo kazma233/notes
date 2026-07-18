@@ -1,0 +1,36 @@
+services:
+  mongo:
+    image: mongo:latest
+    container_name: mongodb_dev
+    restart: always
+    ports:
+      - 27017:27017
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: pw123456
+    volumes:
+      - mongo_db:/data/db
+    networks:
+      - dev
+  mongo-express:
+    image: mongo-express
+    container_name: mongo-express
+    restart: always
+    ports:
+      - 27018:8081
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: root
+      ME_CONFIG_MONGODB_ADMINPASSWORD: pw123456
+      ME_CONFIG_MONGODB_URL: mongodb://admin:pw123456@mongodb_dev:27017/
+    networks:
+      - dev
+
+networks:
+  dev:
+    driver: bridge
+    name: network_bridge_dev
+
+volumes:
+  mongo_db:
+    driver: local
+    name: mongo_db
