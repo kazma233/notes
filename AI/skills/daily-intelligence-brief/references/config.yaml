@@ -1,0 +1,113 @@
+# 使用 IANA 时区名称。用于解释近 24 小时的时间边界和报告中的时间。
+timezone: Asia/Shanghai
+
+# 报告写入的本地目录。支持 ~；目录不存在时创建。
+report_dir: ~/DailyBriefs
+
+# RSS、OPML 子源和正文抓取共用的最大并发数。
+rss_concurrency: 8
+
+# 单个关注方向最多保留的正文条目数。
+max_items_per_topic: 10
+
+# 近一年内有更新且已验证可用的 RSS/Atom 源。
+rss_sources:
+  - name: Scott Hanselman
+    url: http://feeds.feedburner.com/ScottHanselman
+  - name: ByteByteGo
+    url: https://blog.bytebytego.com/feed
+  - name: Python Blog
+    url: https://blog.python.org/feeds/posts/default?alt=rss
+  - name: Golang Weekly
+    url: https://cprss.s3.amazonaws.com/golangweekly.com.xml
+  - name: PostgreSQL Weekly
+    url: https://cprss.s3.amazonaws.com/postgresweekly.com.xml
+  - name: Darmau
+    url: https://darmau.co/zh/article/rss.xml
+  - name: Ein Verne
+    url: https://einverne.github.io/feed.xml
+  - name: 阮一峰的网络日志
+    url: https://feeds.feedburner.com/ruanyifeng
+  - name: Julia Evans
+    url: https://jvns.ca/atom.xml
+  - name: System Design One
+    url: https://newsletter.systemdesign.one/feed
+  - name: Noted
+    url: https://noted.lol/rss
+  - name: PyCoder's Weekly
+    url: https://pycoders.com/feed/JX9f9PeH
+  - name: 定义
+    url: https://quaily.com/dingyi/feed/atom
+  - name: Just Go Idea
+    url: https://quaily.com/justgoidea/feed/atom
+  - name: AIGC Weekly
+    url: https://quaily.com/op7418/feed/atom
+  - name: Beehiiv pLuxCxjIqK
+    url: https://rss.beehiiv.com/feeds/pLuxCxjIqK.xml
+  - name: Sam Who
+    url: https://samwho.dev/rss.xml
+  - name: Sazak
+    url: https://sazak.io/atom.xml
+  - name: 宝玉的分享
+    url: https://s.baoyu.io/feed.xml
+  - name: Spring Blog
+    url: https://spring.io/blog.atom
+  - name: 少数派
+    url: https://sspai.com/feed
+  - name: This Week in Rust
+    url: https://this-week-in-rust.org/rss.xml
+  - name: 老胡的周刊
+    url: https://weekly.howie6879.com/rss/rss.xml
+  - name: 潮流周刊
+    url: https://weekly.tw93.fun/rss.xml
+  - name: Wukan
+    url: https://wukan.me/?feed=rss2
+  - name: 爱范儿
+    url: https://www.ifanr.com/feed
+  - name: Macin
+    url: https://www.macin.org/atom.xml
+  - name: Raychase
+    url: https://www.raychase.net/feed
+  - name: Skyue
+    url: https://www.skyue.com/feed
+  - name: Supertechfans
+    url: https://www.supertechfans.com/cn/index.xml
+
+# OPML 是订阅目录。程序会展开其中的 xmlUrl、去重后按 rss_concurrency 抓取。
+opml_sources: []
+  # - name: Engineering Blogs
+  #   url: https://engblogs.s3.amazonaws.com/engblogs.opml
+
+# 用户指定的网站探索入口。URL 可以是首页、栏目页、站内搜索页或 sitemap，
+# 不是 RSS 地址。默认只在同一 host 内发现文章；include_patterns 存在时还必须匹配。
+site_sources:
+  - name: OpenAI News
+    url: https://openai.com/news/
+    include_patterns:
+      - '^https://openai\.com/news/?(?:[?#].*)?$'
+      - '^https://openai\.com/index/[^/?#]+/?(?:[?#].*)?$'
+    max_discovery_pages: 20
+    max_articles: 50
+  - name: TechCrunch AI
+    url: https://techcrunch.com/category/artificial-intelligence/
+    include_patterns:
+      - '^https://techcrunch\.com/category/artificial-intelligence(?:/page/\d+)?/?(?:[?#].*)?$'
+      - '^https://techcrunch\.com/\d{4}/\d{2}/\d{2}/[^/?#]+/?(?:[?#].*)?$'
+    max_discovery_pages: 20
+    max_articles: 50
+  - name: 36kr
+    url: https://36kr.com/
+    max_discovery_pages: 20
+    max_articles: 50
+  - name: jiemian
+    url: https://www.jiemian.com/
+    max_discovery_pages: 20
+    max_articles: 50
+  - name: thepaper
+    url: https://www.thepaper.cn//
+    max_discovery_pages: 20
+    max_articles: 50
+
+# topic 只需给出长期关注方向。采集时会自行推导当日的中英文探索词和子议题。
+topics:
+  - direction: 'ai news today'

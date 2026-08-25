@@ -1,0 +1,6 @@
+interface:
+  display_name: "每日情报日报"
+  short_description: "聚合 RSS、指定网站与中英文话题，生成带来源评分的每日情报日报"
+  default_prompt: "使用 $daily-intelligence-brief 根据配置生成近 24 小时的情报日报。"
+policy:
+  allow_implicit_invocation: false
