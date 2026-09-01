@@ -1,7 +1,7 @@
 services:
   sub:
-    container_name: "subconverter"
-    image: "tindy2013/subconverter:latest"
+    container_name: "metacubex_subconverter"
+    image: "ghcr.io/metacubex/subconverter:latest"
     ports: 
       - "25500:25500"
     restart: always
