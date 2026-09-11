@@ -40,6 +40,8 @@ const MAX_STDERR_BYTES = 50 * 1024;
 const MAX_SUBAGENT_DEPTH = 1;
 const TRUNCATION_MARKER_RESERVE = 160;
 const SENSITIVE_ARGUMENT_PATTERN = /(password|secret|token|api[-_]?key|authorization|cookie)/i;
+const TMP_PREFIX = "pi-subagent-";
+const TMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -222,6 +224,39 @@ function getResultOutput(result: SingleResult): string {
 	return getFinalOutput(result.messages) || "(no output)";
 }
 
+function countNewlines(input: string): number {
+	let count = 0;
+	let from = 0;
+	for (;;) {
+		const next = input.indexOf("\n", from);
+		if (next < 0) return count;
+		count++;
+		from = next + 1;
+	}
+}
+
+/** UTF-8 byte length of one code point; matches Buffer.byteLength, lone surrogates included. */
+function utf8LengthOfCodePoint(character: string): number {
+	const codePoint = character.codePointAt(0) ?? 0;
+	if (codePoint < 0x80) return 1;
+	if (codePoint < 0x800) return 2;
+	if (codePoint < 0x10000) return 3;
+	return 4;
+}
+
+/** Longest prefix of `input` that fits in `cap` UTF-8 bytes, never splitting a character. */
+function takeUtf8PrefixWithinByteCap(input: string, cap: number): string {
+	const chunks: string[] = [];
+	let bytes = 0;
+	for (const character of input) {
+		const size = utf8LengthOfCodePoint(character);
+		if (bytes + size > cap) break;
+		chunks.push(character);
+		bytes += size;
+	}
+	return chunks.join("");
+}
+
 function truncateOutput(
 	output: string,
 	maxBytes = PER_TASK_OUTPUT_CAP,
@@ -229,23 +264,36 @@ function truncateOutput(
 	fullOutputPath?: string,
 ): string {
 	const originalBytes = Buffer.byteLength(output, "utf8");
-	const originalLines = output.split("\n").length;
-	let truncated = originalLines > maxLines ? output.split("\n").slice(0, maxLines).join("\n") : output;
-	let truncatedBytes = Buffer.byteLength(truncated, "utf8");
+	const originalLines = countNewlines(output) + 1;
 
+	let truncated = output;
+	if (originalLines > maxLines) {
+		// Keep the first `maxLines` lines: cut at the maxLines-th newline.
+		let cut = output.length;
+		let from = 0;
+		for (let line = 0; line < maxLines; line++) {
+			const next = output.indexOf("\n", from);
+			if (next < 0) {
+				cut = output.length;
+				break;
+			}
+			cut = next;
+			from = next + 1;
+		}
+		truncated = output.slice(0, cut);
+	}
+
+	let truncatedBytes = Buffer.byteLength(truncated, "utf8");
 	const contentMaxBytes = Math.max(0, maxBytes - TRUNCATION_MARKER_RESERVE);
 	if (truncatedBytes > contentMaxBytes) {
-		truncated = Array.from(truncated).reduce((value, character) => {
-			if (Buffer.byteLength(value + character, "utf8") > contentMaxBytes) return value;
-			return value + character;
-		}, "");
+		truncated = takeUtf8PrefixWithinByteCap(truncated, contentMaxBytes);
 		truncatedBytes = Buffer.byteLength(truncated, "utf8");
 	}
 
 	if (truncatedBytes === originalBytes && originalLines <= maxLines) return output;
 
 	const omittedBytes = Math.max(0, originalBytes - truncatedBytes);
-	const omittedLines = Math.max(0, originalLines - truncated.split("\n").length);
+	const omittedLines = Math.max(0, originalLines - (countNewlines(truncated) + 1));
 	const omitted = omittedLines > 0 ? `${omittedLines} lines` : `${omittedBytes} bytes`;
 	const fullOutputNotice = fullOutputPath
 		? `Full output saved to: ${fullOutputPath}. Use read to inspect it.`
@@ -348,14 +396,47 @@ async function writePromptToTempFile(agentName: string, prompt: string): Promise
 	return { dir: tmpDir, filePath };
 }
 
+const liveOutputDirs = new Set<string>();
+
 async function writeOutputToTempFile(agentName: string, output: string): Promise<string> {
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-output-"));
 	const safeName = agentName.replace(/[^\w.-]+/g, "_");
 	const filePath = path.join(tmpDir, `${safeName}.md`);
+	liveOutputDirs.add(tmpDir);
 	await withFileMutationQueue(filePath, async () => {
 		await fs.promises.writeFile(filePath, output, { encoding: "utf-8", mode: 0o600 });
 	});
 	return filePath;
+}
+
+/**
+ * Remove stale subagent temp dirs left behind by crashed or killed processes.
+ * `lstat` is deliberate: a symlink named with our prefix must not be followed.
+ */
+async function sweepStaleSubagentTempDirs(maxAgeMs = TMP_MAX_AGE_MS): Promise<void> {
+	const root = os.tmpdir();
+	let names: string[];
+	try {
+		names = await fs.promises.readdir(root);
+	} catch {
+		return;
+	}
+	const now = Date.now();
+	await Promise.all(
+		names
+			.filter((name) => name.startsWith(TMP_PREFIX))
+			.map(async (name) => {
+				const full = path.join(root, name);
+				try {
+					const stats = await fs.promises.lstat(full);
+					if (!stats.isDirectory()) return;
+					if (now - stats.mtimeMs < maxAgeMs) return;
+					await fs.promises.rm(full, { recursive: true, force: true });
+				} catch {
+					/* ignore */
+				}
+			}),
+	);
 }
 
 async function getOutputPreview(agentName: string, output: string, maxBytes = PER_TASK_OUTPUT_CAP): Promise<{ content: string; outputPath?: string }> {
@@ -723,6 +804,19 @@ const SubagentParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	void sweepStaleSubagentTempDirs();
+
+	// Output files stay readable for the whole session, so only reclaim them on real exit.
+	// reload/resume/new/fork may continue using this session, where the path is still in context.
+	pi.on("session_shutdown", async (event) => {
+		if (event.reason !== "quit") return;
+		const dirs = [...liveOutputDirs];
+		liveOutputDirs.clear();
+		await Promise.all(
+			dirs.map((dir) => fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {})),
+		);
+	});
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
