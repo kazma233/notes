@@ -9,12 +9,12 @@
  * 配置格式（与 Codex config.toml 的 MCP Server 语义一致，遵循 MCP 标准）：
  * {
  *   "mcpServers": {
- *     "tapd": { "command": "uvx", "args": ["mcp-server-tapd"], "env": { "TAPD_ACCESS_TOKEN": "${TAPD_ACCESS_TOKEN}" } },
+ *     "tapd": { "command": "uvx", "args": ["mcp-server-tapd"], "env": { "TAPD_ACCESS_TOKEN": "${TAPD_ACCESS_TOKEN}" }, "idleTimeout": 10 },
  *     "db_mcp": { "url": "http://localhost:8320/mcp", "headers": {} }
  *   }
  * }
  *
- * env / headers 的值支持 ${VAR} 从 pi 进程环境变量展开，避免把密钥明文写进配置文件。
+ * env / headers 的值支持 ${VAR} 插值，避免把密钥明文写进配置文件。
  *
  * 工具命名规则：mcp__{server}__{tool}，LLM 调它即转发到对应 MCP Server 的 tools/call。
  *
@@ -28,10 +28,11 @@
 import { CONFIG_DIR_NAME, type ExtensionAPI, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { readFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, unlinkSync, rmdirSync } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { join, resolve, dirname } from "node:path";
+import { tmpdir } from "node:os";
 
 // 请求超时：MCP Server 可能执行较久，默认 5 分钟。
 const REQUEST_TIMEOUT_MS = 300_000;
@@ -43,6 +44,15 @@ const CLOSE_TIMEOUT_MS = 5_000;
 const MAX_LOG_ENTRIES = 200;
 // MCP 协议版本：与主流 SDK 及 tapd/db_mcp 等 Server 兼容。
 const PROTOCOL_VERSION = "2025-06-18";
+// 连接无调用达到该时长后释放，下一次工具调用会重新建立连接。
+const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
+// 连接失败采用有上限的指数退避，避免 Server 异常时持续拉起进程/请求。
+const RETRY_BASE_DELAY_MS = 1_000;
+const RETRY_MAX_DELAY_MS = 60_000;
+// 单次工具结果的模型可见文本上限，防止异常 Server 膨胀上下文与会话文件。
+const MAX_OUTPUT_BYTES = 50 * 1024;
+const MAX_OUTPUT_LINES = 2_000;
+const MAX_BINARY_RESOURCE_BYTES = 10 * 1024 * 1024;
 
 interface McpServerConfig {
   command?: string;
@@ -52,6 +62,8 @@ interface McpServerConfig {
   url?: string;
   headers?: Record<string, string>;
   enabled?: boolean;
+  /** 空闲回收时间，单位分钟；0 表示不回收。 */
+  idleTimeout?: number;
 }
 
 interface McpTool {
@@ -60,6 +72,22 @@ interface McpTool {
   description?: string;
   inputSchema?: unknown;
   annotations?: { title?: string };
+}
+
+/** 已连接的 Server 及其实际注册工具数（撞名或无效工具名会被跳过，因此可能少于 Server 声明的数量）。 */
+interface RegisteredClient {
+  config: McpServerConfig;
+  client: McpClient | null;
+  toolCount: number;
+  toolNames: Set<string>;
+  status: "connecting" | "connected" | "disconnected" | "idle" | "closed";
+  lastUsedAt: number;
+  retryAttempt: number;
+  retryTimer?: NodeJS.Timeout;
+  idleTimer?: NodeJS.Timeout;
+  connectPromise?: Promise<boolean>;
+  inFlight: number;
+  stopping: boolean;
 }
 
 /** MCP inputSchema 本身就是 JSON Schema，原样保留可避免桥接层丢失引用和约束。 */
@@ -80,9 +108,12 @@ function makeToolName(server: string, tool: string): string {
   return `mcp__${serverName}__${toolName}`;
 }
 
-/** 把配置里的 ${VAR} 展开为 pi 进程环境变量值；未定义则留空，避免把密钥明文写进配置。 */
+/** 把配置里的 ${VAR} 展开为 pi 进程环境变量值；未定义直接报错，避免带空凭据启动。 */
 function expandEnv(value: string, env: NodeJS.ProcessEnv = process.env): string {
-  return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, key: string) => env[key] ?? "");
+  return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, key: string) => {
+    if (env[key] === undefined) throw new Error(`环境变量 ${key} 未设置`);
+    return env[key]!;
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -101,7 +132,8 @@ function isMcpServerConfig(value: unknown): value is McpServerConfig {
     && (value.cwd === undefined || typeof value.cwd === "string")
     && (value.url === undefined || typeof value.url === "string")
     && (value.headers === undefined || isStringRecord(value.headers))
-    && (value.enabled === undefined || typeof value.enabled === "boolean");
+    && (value.enabled === undefined || typeof value.enabled === "boolean")
+    && (value.idleTimeout === undefined || (typeof value.idleTimeout === "number" && Number.isFinite(value.idleTimeout) && value.idleTimeout >= 0));
 }
 
 /**
@@ -145,14 +177,18 @@ interface McpTransport {
   notify(method: string, params?: unknown): void;
   setProtocolVersion?(version: string): void;
   close(): Promise<void>;
+  onclose?: () => void;
+  onnotification?: (method: string, params: unknown) => void;
 }
 
 class StdioTransport implements McpTransport {
+  onclose?: () => void;
+  onnotification?: (method: string, params: unknown) => void;
   private child!: ChildProcess;
   private rl: ReturnType<typeof createInterface>;
   private nextId = 0;
   private failure: Error | null = null;
-  private stderrLogged = false;
+  private closeNotified = false;
   private pending = new Map<number, {
     resolve: (v: any) => void;
     reject: (e: Error) => void;
@@ -161,11 +197,11 @@ class StdioTransport implements McpTransport {
     onAbort?: () => void;
   }>();
 
-  constructor(private cfg: McpServerConfig, private onLog: (msg: string) => void) {}
+  constructor(private cfg: McpServerConfig) {}
 
   async start(): Promise<void> {
     const env = { ...process.env, ...Object.fromEntries(
-      Object.entries(this.cfg.env ?? {}).map(([k, v]) => [k, expandEnv(v)]),
+      Object.entries(this.cfg.env ?? {}).map(([key, value]) => [key, expandEnv(value)]),
     ) };
     this.child = spawn(this.cfg.command!, this.cfg.args ?? [], {
       env, stdio: ["pipe", "pipe", "pipe"],
@@ -173,12 +209,8 @@ class StdioTransport implements McpTransport {
     });
     this.rl = createInterface({ input: this.child.stdout! });
     this.rl.on("line", (line) => this.onLine(line));
-    this.child.stderr!.on("data", () => {
-      if (!this.stderrLogged) {
-        this.stderrLogged = true;
-        this.onLog("Server 输出了 stderr，内容已隐藏以避免泄露敏感信息");
-      }
-    });
+    // stderr 必须持续消费，否则管道缓冲写满会阻塞 Server 进程；内容不记录，避免泄露敏感信息。
+    this.child.stderr!.on("data", () => {});
     this.child.on("error", (error) => this.fail(new Error(`stdio 启动失败: ${error.message}`)));
     this.child.stdin!.on("error", (error) => this.fail(new Error(`stdio 写入失败: ${error.message}`)));
     this.child.on("exit", (code, sig) => {
@@ -188,6 +220,10 @@ class StdioTransport implements McpTransport {
 
   private fail(error: Error): void {
     this.failure ??= error;
+    if (!this.closeNotified) {
+      this.closeNotified = true;
+      this.onclose?.();
+    }
     for (const id of this.pending.keys()) this.rejectPending(id, error);
   }
 
@@ -214,6 +250,10 @@ class StdioTransport implements McpTransport {
     if (!trimmed) return;
     let msg: any;
     try { msg = JSON.parse(trimmed); } catch { return; }
+    if (typeof msg.method === "string") {
+      this.onnotification?.(msg.method, msg.params);
+      return;
+    }
     if (typeof msg.id === "number" && this.pending.has(msg.id)) {
       if (msg.error) this.rejectPending(msg.id, new Error(msg.error?.message || "MCP error"));
       else this.resolvePending(msg.id, msg.result);
@@ -230,7 +270,11 @@ class StdioTransport implements McpTransport {
         this.rejectPending(id, new Error(`timeout: ${method} > ${REQUEST_TIMEOUT_MS}ms`));
       }, REQUEST_TIMEOUT_MS);
       timer.unref();
-      const onAbort = () => this.rejectPending(id, new Error(`请求已取消: ${method}`));
+      const onAbort = () => {
+        if (!this.pending.has(id)) return;
+        this.notify("notifications/cancelled", { requestId: id, reason: `请求已取消: ${method}` });
+        this.rejectPending(id, new Error(`请求已取消: ${method}`));
+      };
       this.pending.set(id, { resolve, reject, timer, signal, onAbort });
       signal?.addEventListener("abort", onAbort, { once: true });
       try {
@@ -249,6 +293,7 @@ class StdioTransport implements McpTransport {
   }
 
   async close(): Promise<void> {
+    this.closeNotified = true;
     this.fail(new Error("MCP stdio transport 已关闭"));
     this.rl?.close();
     if (this.child && !this.child.killed) this.child.kill();
@@ -256,6 +301,8 @@ class StdioTransport implements McpTransport {
 }
 
 class StreamableHttpTransport implements McpTransport {
+  onclose?: () => void;
+  onnotification?: (method: string, params: unknown) => void;
   private sessionId: string | null = null;
   private protocolVersion: string | null = null;
   private nextId = 0;
@@ -311,7 +358,10 @@ class StreamableHttpTransport implements McpTransport {
         signal: requestSignal,
       });
     } catch (error) {
-      if (signal?.aborted) throw new Error(`请求已取消: ${method}`);
+      if (signal?.aborted) {
+        this.notify("notifications/cancelled", { requestId: id, reason: `请求已取消: ${method}` });
+        throw new Error(`请求已取消: ${method}`);
+      }
       throw error;
     }
     if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
@@ -324,6 +374,11 @@ class StreamableHttpTransport implements McpTransport {
       msgs = contentType.includes("text/event-stream") ? this.parseSse(text) : [JSON.parse(text)];
     } catch (e) {
       throw new Error(`HTTP 响应解析失败: ${String(e)}`);
+    }
+    for (const notification of msgs) {
+      if (notification && typeof notification.method === "string") {
+        this.onnotification?.(notification.method, notification.params);
+      }
     }
     const msg = msgs.find((m) => m && m.id === id);
     if (!msg) throw new Error("HTTP 响应无匹配 JSON-RPC 消息");
@@ -360,7 +415,13 @@ class StreamableHttpTransport implements McpTransport {
 class McpClient {
   private tools: McpTool[] = [];
 
-  constructor(private transport: McpTransport) {}
+  onclose?: () => void;
+  onnotification?: (method: string, params: unknown) => void;
+
+  constructor(private transport: McpTransport) {
+    transport.onclose = () => this.onclose?.();
+    transport.onnotification = (method, params) => this.onnotification?.(method, params);
+  }
 
   async initialize(signal?: AbortSignal): Promise<void> {
     const result = await this.transport.request("initialize", {
@@ -394,31 +455,351 @@ class McpClient {
   close(): Promise<void> { return this.transport.close(); }
 }
 
-/** 把 MCP 返回的 content 数组折叠成一段文本，供 pi 工具返回；图片/资源用占位描述。 */
-function mcpContentToText(content: unknown): string {
-  if (!Array.isArray(content)) return content == null ? "" : JSON.stringify(content);
-  const parts: string[] = [];
-  for (const item of content) {
-    if (!item || typeof item !== "object") continue;
-    const it = item as any;
-    if (it.type === "text") parts.push(String(it.text ?? ""));
-    else if (it.type === "image") parts.push(`[image: ${it.mimeType ?? "unknown"}]`);
-    else if (it.type === "resource") parts.push(`[resource: ${it.resource?.uri ?? it.resource?.text ?? "unknown"}]`);
-    else parts.push(JSON.stringify(it));
+type PiToolContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
+
+function limitOutputText(value: string, maxBytes = MAX_OUTPUT_BYTES): string {
+  const lines = value.split(/\r?\n/);
+  let limited = lines.length > MAX_OUTPUT_LINES
+    ? `${lines.slice(0, MAX_OUTPUT_LINES).join("\n")}\n[输出已按行数截断]`
+    : value;
+  if (Buffer.byteLength(limited, "utf8") <= maxBytes) return limited;
+
+  let end = Math.min(limited.length, maxBytes);
+  while (end > 0 && Buffer.byteLength(limited.slice(0, end), "utf8") > Math.max(0, maxBytes - 32)) end--;
+  limited = `${limited.slice(0, end)}\n[输出已按字节数截断]`;
+  return limited;
+}
+
+/** 保留 MCP 原生文本/图片内容；无法映射到 Pi 的资源类型时只返回安全的引用信息。 */
+function mcpContentToPiContent(
+  content: unknown,
+  structuredContent?: unknown,
+  materializeResource?: (blob: string, mimeType: string) => string | null,
+): PiToolContent[] {
+  const result: PiToolContent[] = [];
+  let textBytes = 0;
+  const boundedText = (value: string): string => {
+    const remaining = MAX_OUTPUT_BYTES - textBytes;
+    if (remaining <= 0) return "";
+    const next = limitOutputText(value, remaining);
+    textBytes += Buffer.byteLength(next, "utf8");
+    return next;
+  };
+  if (Array.isArray(content)) {
+    for (const item of content) {
+      if (!item || typeof item !== "object") continue;
+      const it = item as any;
+      if (it.type === "text") {
+        const text = boundedText(String(it.text ?? ""));
+        if (text) result.push({ type: "text", text });
+      } else if (it.type === "image" && typeof it.data === "string") {
+        const mimeType = String(it.mimeType ?? "application/octet-stream");
+        if (Buffer.byteLength(it.data, "base64") <= MAX_BINARY_RESOURCE_BYTES) {
+          result.push({ type: "image", data: it.data, mimeType });
+        } else {
+          const path = materializeResource?.(it.data, mimeType);
+          result.push({ type: "text", text: path ? `[image 已保存到文件] ${path}` : "[image 过大，已省略]" });
+        }
+      } else if (it.type === "resource") {
+        const resource = it.resource ?? {};
+        if (typeof resource.blob === "string") {
+          const mimeType = String(resource.mimeType ?? "application/octet-stream");
+          if (mimeType.startsWith("image/") && Buffer.byteLength(resource.blob, "base64") <= MAX_BINARY_RESOURCE_BYTES) {
+            result.push({ type: "image", data: resource.blob, mimeType });
+          } else {
+            const path = materializeResource?.(resource.blob, mimeType);
+            result.push({ type: "text", text: path ? `[resource 已保存到文件] ${path}` : "[resource 二进制内容过大，已省略]" });
+          }
+        } else {
+          const uri = resource.uri ? `\nURI: ${String(resource.uri)}` : "";
+          const text = typeof resource.text === "string" ? `\n${resource.text}` : "";
+          const resourceText = boundedText(`[resource]${uri}${text}`);
+          if (resourceText) result.push({ type: "text", text: resourceText });
+        }
+      } else if (it.type === "resource_link") {
+        const linkText = boundedText(`[resource_link] ${String(it.uri ?? it.name ?? "unknown")}`);
+        if (linkText) result.push({ type: "text", text: linkText });
+      } else {
+        const otherText = boundedText(JSON.stringify(it) ?? "");
+        if (otherText) result.push({ type: "text", text: otherText });
+      }
+    }
   }
-  return parts.join("\n") || "（空响应）";
+  if (result.length === 0 && structuredContent !== undefined) {
+    const structuredText = boundedText(JSON.stringify(structuredContent) ?? "");
+    if (structuredText) result.push({ type: "text", text: structuredText });
+  }
+  return result.length > 0 ? result : [{ type: "text", text: "（空响应）" }];
+}
+
+function mcpContentToText(content: unknown, structuredContent?: unknown): string {
+  return mcpContentToPiContent(content, structuredContent)
+    .filter((item): item is { type: "text"; text: string } => item.type === "text")
+    .map((item) => item.text)
+    .join("\n") || "（返回了图片内容）";
+}
+
+function boundStructuredContent(value: unknown): unknown {
+  if (value === undefined) return null;
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value) ?? "null";
+  } catch {
+    return { truncated: true, reason: "structuredContent 无法序列化" };
+  }
+  if (Buffer.byteLength(serialized, "utf8") <= 16 * 1024) return value;
+  return {
+    truncated: true,
+    reason: "structuredContent 超过 16 KiB，已省略原始内容",
+    preview: limitOutputText(serialized, 2 * 1024),
+  };
 }
 
 export default function (pi: ExtensionAPI) {
-  const clients = new Map<string, McpClient>();
+  const clients = new Map<string, RegisteredClient>();
   const log: string[] = [];
+  let shuttingDown = false;
+  let resourceDir: string | undefined;
+  let resourceSequence = 0;
+  const resourceFiles = new Set<string>();
 
   const appendLog = (message: string): void => {
     log.push(message);
     if (log.length > MAX_LOG_ENTRIES) log.splice(0, log.length - MAX_LOG_ENTRIES);
   };
 
+  const materializeResource = (blob: string, mimeType: string): string | null => {
+    const bytes = Buffer.byteLength(blob, "base64");
+    if (bytes > MAX_BINARY_RESOURCE_BYTES) return null;
+    try {
+      resourceDir ??= mkdtempSync(join(tmpdir(), "pi-mcp-resource-"));
+      const extension = mimeType.split("/")[1]?.replace(/[^a-zA-Z0-9]+/g, "") || "bin";
+      const path = join(resourceDir, `resource-${++resourceSequence}.${extension}`);
+      writeFileSync(path, Buffer.from(blob, "base64"), { flag: "wx", mode: 0o600 });
+      resourceFiles.add(path);
+      return path;
+    } catch (error) {
+      appendLog(`MCP resource 保存失败: ${String(error)}`);
+      return null;
+    }
+  };
+
+  const cleanupResources = (): void => {
+    for (const path of resourceFiles) {
+      try { unlinkSync(path); } catch { /* 临时文件可能已被用户移走 */ }
+    }
+    resourceFiles.clear();
+    if (resourceDir) {
+      try { rmdirSync(resourceDir); } catch { /* 目录非空时保留，避免误删其他文件 */ }
+      resourceDir = undefined;
+    }
+  };
+
+  const registeredToolNames = new Set<string>();
+  const idleTimeoutMs = (entry: RegisteredClient): number => entry.config.idleTimeout === undefined
+    ? DEFAULT_IDLE_TIMEOUT_MS
+    : entry.config.idleTimeout * 60 * 1000;
+  const clearIdleTimer = (entry: RegisteredClient): void => {
+    if (entry.idleTimer) clearTimeout(entry.idleTimer);
+    entry.idleTimer = undefined;
+  };
+  const clearRetryTimer = (entry: RegisteredClient): void => {
+    if (entry.retryTimer) clearTimeout(entry.retryTimer);
+    entry.retryTimer = undefined;
+  };
+
+  const scheduleIdleReclaim = (name: string, entry: RegisteredClient): void => {
+    clearIdleTimer(entry);
+    const timeout = idleTimeoutMs(entry);
+    if (timeout <= 0 || entry.status !== "connected") return;
+    entry.idleTimer = setTimeout(() => {
+      entry.idleTimer = undefined;
+      if (shuttingDown || entry.status !== "connected") return;
+      if (entry.inFlight > 0 || Date.now() - entry.lastUsedAt < timeout) {
+        scheduleIdleReclaim(name, entry);
+        return;
+      }
+      void disconnectServer(name, entry, "空闲回收", false);
+    }, timeout);
+    entry.idleTimer.unref();
+  };
+
+  const scheduleReconnect = (name: string, entry: RegisteredClient): void => {
+    if (shuttingDown || entry.stopping || entry.retryTimer || entry.status === "closed") return;
+    const delay = Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * 2 ** Math.min(entry.retryAttempt, 6));
+    entry.retryAttempt++;
+    appendLog(`[${name}] 将在 ${Math.ceil(delay / 1000)} 秒后重连（第 ${entry.retryAttempt} 次）`);
+    entry.retryTimer = setTimeout(() => {
+      entry.retryTimer = undefined;
+      void connectServer(name, entry);
+    }, delay);
+    entry.retryTimer.unref();
+  };
+
+  async function disconnectServer(name: string, entry: RegisteredClient, reason: string, reconnect: boolean): Promise<void> {
+    clearIdleTimer(entry);
+    clearRetryTimer(entry);
+    const oldClient = entry.client;
+    entry.client = null;
+    entry.status = reconnect ? "disconnected" : "idle";
+    if (oldClient) {
+      entry.stopping = true;
+      await oldClient.close().catch((error) => appendLog(`[${name}] 关闭连接失败: ${String(error)}`));
+      entry.stopping = false;
+    }
+    appendLog(`[${name}] ${reason}`);
+    if (reconnect) scheduleReconnect(name, entry);
+  }
+
+  function registerServerTools(name: string, entry: RegisteredClient, tools: McpTool[]): void {
+    for (const tool of tools) {
+      const toolName = makeToolName(name, tool.name);
+      if (!toolName) {
+        appendLog(`[${name}] 工具名无有效字符，已跳过`);
+        continue;
+      }
+      if (entry.toolNames.has(toolName)) continue;
+      if (registeredToolNames.has(toolName)) {
+        entry.toolNames.add(toolName);
+        continue;
+      }
+      const label = tool.title || tool.annotations?.title || tool.name;
+      const description = tool.description || label;
+      const serverName = name;
+      const rawToolName = tool.name;
+      try {
+        pi.registerTool({
+          name: toolName,
+          label: `${label} (${serverName})`,
+          description: `${description}\n\n[由 MCP Server \"${serverName}\" 桥接提供]`,
+          parameters: jsonSchemaToTypeBox(tool.inputSchema ?? {}),
+          async execute(_toolCallId, params, signal, _onUpdate) {
+            if (signal?.aborted) throw new Error(`MCP Server \"${serverName}\" 工具 \"${rawToolName}\" 已取消`);
+            const current = clients.get(serverName);
+            if (!current) throw new Error(`MCP Server \"${serverName}\" 未初始化`);
+            const client = await ensureConnected(serverName, current);
+            if (!client) throw new Error(`MCP Server \"${serverName}\" 当前不可用，稍后会自动重连`);
+            current.lastUsedAt = Date.now();
+            current.inFlight++;
+            try {
+              let res: any;
+              try {
+                res = await client.callTool(rawToolName, (params as Record<string, unknown>) ?? {}, signal);
+              } catch (error) {
+                if (!signal?.aborted && current.client === client) {
+                  void disconnectServer(serverName, current, `连接失效: ${String(error)}`, true);
+                }
+                throw error;
+              }
+              const content = mcpContentToPiContent(res?.content, res?.structuredContent, materializeResource);
+              if (res?.isError) throw new Error(mcpContentToText(res?.content, res?.structuredContent) || "MCP 工具执行失败");
+              return { content, details: { structuredContent: boundStructuredContent(res?.structuredContent) } };
+            } catch (error) {
+              throw new Error(`请求 MCP Server \"${serverName}\" 工具 \"${rawToolName}\" 失败: ${String(error)}`);
+            } finally {
+              current.inFlight--;
+              current.lastUsedAt = Date.now();
+              scheduleIdleReclaim(serverName, current);
+            }
+          },
+        });
+        registeredToolNames.add(toolName);
+        entry.toolNames.add(toolName);
+      } catch (error) {
+        appendLog(`[${name}] 注册工具 ${toolName} 失败: ${String(error)}`);
+      }
+    }
+    entry.toolCount = entry.toolNames.size;
+  }
+
+  async function refreshServerTools(name: string, entry: RegisteredClient, client: McpClient): Promise<void> {
+    if (entry.client !== client || entry.status !== "connected") return;
+    try {
+      const tools = await client.listTools();
+      if (entry.client !== client || entry.status !== "connected") return;
+      registerServerTools(name, entry, tools);
+      appendLog(`[${name}] 工具目录已刷新，共 ${tools.length} 个工具`);
+    } catch (error) {
+      if (entry.client === client) await disconnectServer(name, entry, `工具目录刷新失败: ${String(error)}`, true);
+    }
+  }
+
+  async function connectServer(name: string, entry: RegisteredClient): Promise<boolean> {
+    if (shuttingDown || entry.status === "closed") return false;
+    if (entry.connectPromise) return entry.connectPromise;
+    clearRetryTimer(entry);
+    entry.status = "connecting";
+    const connectPromise = (async (): Promise<boolean> => {
+      let transport: McpTransport | null = null;
+      let client: McpClient | null = null;
+      const connectController = new AbortController();
+      const timeoutId = setTimeout(() => connectController.abort(), CONNECT_TIMEOUT_MS);
+      timeoutId.unref();
+      try {
+        const cfg = entry.config;
+        if (cfg.command && cfg.command.trim()) {
+          const stdioTransport = new StdioTransport(cfg);
+          await stdioTransport.start();
+          transport = stdioTransport;
+        } else if (cfg.url && cfg.url.trim()) {
+          const headers = Object.fromEntries(Object.entries(cfg.headers ?? {}).map(([k, v]) => [k, expandEnv(v)]));
+          transport = new StreamableHttpTransport(cfg.url, headers);
+        } else {
+          throw new Error("Server 需配置 command 或 url");
+        }
+        client = new McpClient(transport);
+        entry.client = client;
+        client.onclose = () => {
+          if (!entry.stopping && entry.client === client) void disconnectServer(name, entry, "连接已断开", true);
+        };
+        client.onnotification = (method) => {
+          if (method === "notifications/tools/list_changed") void refreshServerTools(name, entry, client!);
+        };
+        await client.initialize(connectController.signal);
+        const tools = await client.listTools(connectController.signal);
+        if (entry.client !== client) return false;
+        entry.status = "connected";
+        entry.retryAttempt = 0;
+        entry.lastUsedAt = Date.now();
+        registerServerTools(name, entry, tools);
+        scheduleIdleReclaim(name, entry);
+        appendLog(`[${name}] 连接成功，注册 ${entry.toolCount} 个工具`);
+        return true;
+      } catch (error) {
+        if (entry.client === client) entry.client = null;
+        entry.status = "disconnected";
+        if (transport) await transport.close().catch(() => {});
+        appendLog(`[${name}] 连接失败: ${String(error)}`);
+        scheduleReconnect(name, entry);
+        return false;
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    })();
+    entry.connectPromise = connectPromise;
+    try {
+      return await connectPromise;
+    } finally {
+      if (entry.connectPromise === connectPromise) entry.connectPromise = undefined;
+    }
+  }
+
+  async function ensureConnected(name: string, entry: RegisteredClient): Promise<McpClient | null> {
+    if (entry.status === "connected" && entry.client) {
+      entry.lastUsedAt = Date.now();
+      scheduleIdleReclaim(name, entry);
+      return entry.client;
+    }
+    clearRetryTimer(entry);
+    const connected = await connectServer(name, entry);
+    return connected ? entry.client : null;
+  }
+
   pi.on("session_start", async (_event, ctx) => {
+    shuttingDown = false;
+    const previous = [...clients.entries()];
+    clients.clear();
+    await Promise.allSettled(previous.map(([name, entry]) => disconnectServer(name, entry, "会话重启关闭", false)));
     const globalConfigPath = join(dirname(getAgentDir()), "mcp.json");
     const projectConfigPath = join(ctx.cwd, CONFIG_DIR_NAME, "mcp.json");
 
@@ -455,7 +836,7 @@ export default function (pi: ExtensionAPI) {
         servers.set(name, resolveServerConfig(value, ctx.cwd));
         count++;
       }
-      appendLog(`来自 ${source.path}，共 ${count} 个 Server`);
+      appendLog(`配置来源：${source.path}（${count} 个 Server）`);
     }
 
     const entries = [...servers.entries()];
@@ -464,122 +845,75 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // 单个 Server 连接超时：超时竞速跳过，不影响其他 Server。
-    const results = await Promise.all(entries.map(async ([name, cfg]) => {
-      let transport: McpTransport | null = null;
-      const connectController = new AbortController();
-      const connecting = (async (): Promise<{ client: McpClient; tools: McpTool[] }> => {
-        if (cfg.command && cfg.command.trim()) {
-          const t = new StdioTransport(cfg, (m) => appendLog(`[${name}] ${m}`));
-          await t.start();
-          transport = t;
-        } else if (cfg.url && cfg.url.trim()) {
-          const headers = Object.fromEntries(
-            Object.entries(cfg.headers ?? {}).map(([k, v]) => [k, expandEnv(v)]),
-          );
-          transport = new StreamableHttpTransport(cfg.url, headers);
-        } else {
-          throw new Error("Server 需配置 command 或 url");
-        }
-        const client = new McpClient(transport);
-        await client.initialize(connectController.signal);
-        const tools = await client.listTools(connectController.signal);
-        return { client, tools };
-      })();
-      let timeoutId: NodeJS.Timeout | undefined;
-      const timeout = new Promise<never>((_resolve, reject) => {
-        timeoutId = setTimeout(() => {
-          connectController.abort();
-          reject(new Error(`连接超时 > ${CONNECT_TIMEOUT_MS}ms`));
-        }, CONNECT_TIMEOUT_MS);
-        timeoutId.unref();
+    for (const [name, config] of entries) {
+      clients.set(name, {
+        config,
+        client: null,
+        toolCount: 0,
+        toolNames: new Set(),
+        status: "disconnected",
+        lastUsedAt: Date.now(),
+        retryAttempt: 0,
+        inFlight: 0,
+        stopping: false,
       });
-      try {
-        return { name, ...(await Promise.race([connecting, timeout])), error: null as Error | null };
-      } catch (e) {
-        connectController.abort();
-        if (transport) await transport.close().catch(() => {});
-        return { name, client: null as McpClient | null, tools: [] as McpTool[], error: e as Error };
-      } finally {
-        if (timeoutId) clearTimeout(timeoutId);
-      }
-    }));
-
-    // 冲突去重：sanitize 后可能撞名，后到的让位。
-    const seen = new Set<string>();
-    let registered = 0;
-    for (const r of results) {
-      const client = r.client;
-      if (!client) {
-        appendLog(`[${r.name}] 连接失败[跳过]: ${r.error?.message ?? "unknown"}`);
-        continue;
-      }
-      clients.set(r.name, client);
-      for (const tool of r.tools) {
-        const toolName = makeToolName(r.name, tool.name);
-        if (!toolName) {
-          appendLog(`[${r.name}] 工具名无有效字符，已跳过`);
-          continue;
-        }
-        if (seen.has(toolName)) {
-          appendLog(`[${r.name}] 工具名冲突（${toolName}）已被其他 Server 占用，跳过`);
-          continue;
-        }
-        seen.add(toolName);
-        const label = tool.title || tool.annotations?.title || tool.name;
-        const description = tool.description || label;
-        const serverName = r.name; // 绑定到闭包，execute 用
-        const rawToolName = tool.name;
-        pi.registerTool({
-          name: toolName,
-          label: `${label} (${serverName})`,
-          description: `${description}\n\n[由 MCP Server \"${serverName}\" 桥接提供]`,
-          parameters: jsonSchemaToTypeBox(tool.inputSchema ?? {}),
-          async execute(_toolCallId, params, signal, _onUpdate) {
-            if (signal?.aborted) throw new Error(`MCP Server "${serverName}" 工具 "${rawToolName}" 已取消`);
-            const c = clients.get(serverName);
-            if (!c) throw new Error(`MCP Server "${serverName}" 已断开`);
-            try {
-              const res: any = await c.callTool(rawToolName, (params as Record<string, unknown>) ?? {}, signal);
-              const text = mcpContentToText(res?.content);
-              const details = { structuredContent: res?.structuredContent ?? null };
-              if (res?.isError) {
-                throw new Error(text || "MCP 工具执行失败");
-              }
-              return { content: [{ type: "text", text: text || "（空响应）" }], details };
-            } catch (e) {
-              throw new Error(`请求 MCP Server "${serverName}" 工具 "${rawToolName}" 失败: ${String(e)}`);
-            }
-          },
-        });
-        registered++;
-      }
-      appendLog(`[${r.name}] 连接成功，注册 ${r.tools.length} 个工具`);
     }
-    appendLog(`MCP 桥接完成：共注册 ${registered} 个工具`);
+    await Promise.all([...clients.entries()].map(([name, entry]) => connectServer(name, entry)));
+
   });
 
   pi.on("session_shutdown", async () => {
+    shuttingDown = true;
     const closing = [...clients.entries()];
     clients.clear();
-    await Promise.allSettled(closing.map(async ([name, client]) => {
-      await client.close();
+    await Promise.allSettled(closing.map(async ([name, entry]) => {
+      entry.status = "closed";
+      clearIdleTimer(entry);
+      clearRetryTimer(entry);
+      if (entry.client) await entry.client.close().catch((error) => appendLog(`[${name}] 关闭连接失败: ${String(error)}`));
       appendLog(`[${name}] 已关闭`);
     }));
+    cleanupResources();
   });
 
   pi.registerCommand("mcp", {
     description: "查看 MCP 桥接状态（连接的 Server、工具数与会话日志）",
     handler: async (_args, ctx) => {
-      const lines = [...log];
+      const lines: string[] = [];
       if (clients.size === 0) {
-        lines.push(`当前没有连接的 MCP Server。检查全局 ${join(dirname(getAgentDir()), "mcp.json")} 或项目 ${join(ctx.cwd, CONFIG_DIR_NAME, "mcp.json")}。`);
+        lines.push("当前没有连接的 MCP Server。");
+        if (log.length === 0) {
+          lines.push(`检查全局 ${join(dirname(getAgentDir()), "mcp.json")} 或项目 ${join(ctx.cwd, CONFIG_DIR_NAME, "mcp.json")}。`);
+        }
+      } else {
+        const connected = [...clients.values()].filter((entry) => entry.status === "connected").length;
+        const total = [...clients.values()].reduce((sum, entry) => sum + entry.toolCount, 0);
+        lines.push(`MCP Server：${connected}/${clients.size} 已连接，共注册 ${total} 个工具`);
+        for (const [name, entry] of clients) lines.push(`- ${name}: ${entry.status}，${entry.toolCount} 个工具`);
       }
-      for (const [name] of clients) lines.push(`- ${name}: 已连接`);
+      // 配置来源、跳过与失败原因单独成段，避免与状态行混在一起。
+      if (log.length > 0) lines.push("", ...log);
       const report = lines.join("\n");
       // 命令的返回值会被 pi 丢弃，必须主动输出；无 UI 模式退回 stderr，避免污染 JSON 事件流。
       if (ctx.hasUI) ctx.ui.notify(report, "info");
       else console.error(report);
+    },
+  });
+
+  pi.registerCommand("mcp-reconnect", {
+    description: "重新连接 MCP Server；不指定名称时重新连接全部 Server",
+    handler: async (args) => {
+      const target = args.trim();
+      const selected = target ? [[target, clients.get(target)] as const] : [...clients.entries()];
+      for (const [name, entry] of selected) {
+        if (!entry) {
+          appendLog(`[${name}] 未找到 MCP Server`);
+          continue;
+        }
+        await disconnectServer(name, entry, "手动断开并重连", false);
+        entry.status = "disconnected";
+        await connectServer(name, entry);
+      }
     },
   });
 }

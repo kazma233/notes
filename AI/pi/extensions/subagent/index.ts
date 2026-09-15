@@ -17,6 +17,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { fileURLToPath } from "node:url";
 import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -29,7 +30,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { BackgroundTaskRegistry, type BackgroundTaskRecord } from "./background.ts";
+import { type AgentConfig, type AgentScope, discoverAgents, formatAgentLine, formatAgentList } from "./agents.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -38,10 +40,20 @@ const PER_TASK_OUTPUT_CAP = 50 * 1024;
 const MAX_OUTPUT_LINES = 2000;
 const MAX_STDERR_BYTES = 50 * 1024;
 const MAX_SUBAGENT_DEPTH = 1;
+const MAX_LISTED_AGENTS = 50;
 const TRUNCATION_MARKER_RESERVE = 160;
 const SENSITIVE_ARGUMENT_PATTERN = /(password|secret|token|api[-_]?key|authorization|cookie)/i;
 const TMP_PREFIX = "pi-subagent-";
 const TMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const MAX_TIMEOUT_MS = 2_147_483_647;
+const BACKGROUND_TASK_ROOT = path.join(getAgentDir(), "subagent-tasks");
+
+// 工具描述只在扩展加载时生成一次，会话中途增删 agent 文件要靠 /subagent:list 刷新
+function describeAgents(agents: AgentConfig[]): string {
+	const { text, remaining } = formatAgentList(agents, MAX_LISTED_AGENTS);
+	const suffix = remaining > 0 ? ` (${remaining} more not listed)` : "";
+	return `Available subagents: ${text}${suffix}.`;
+}
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -325,8 +337,27 @@ function shortenActivityText(value: unknown, maxLength = 64): string {
 	return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
 }
 
+function normalizeActivityText(value: unknown): string {
+	return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+}
+
+function formatFullArgumentValue(key: string, value: unknown): string {
+	if (SENSITIVE_ARGUMENT_PATTERN.test(key)) return "[redacted]";
+	if (typeof value === "string") return JSON.stringify(value);
+	try {
+		return JSON.stringify(value) ?? String(value);
+	} catch {
+		return String(value);
+	}
+}
+
 function getToolActivity(toolName: string, args: Record<string, any>): string {
-	return shortenActivityText(formatToolCallSummary(toolName, args));
+	if (toolName === "bash") {
+		const command = typeof args.command === "string" ? args.command : "...";
+		return `$ ${redactSensitiveText(command)}`;
+	}
+	const entries = Object.entries(args).map(([key, value]) => `${key}=${formatFullArgumentValue(key, value)}`);
+	return entries.length > 0 ? `${toolName} ${entries.join(" ")}` : toolName;
 }
 
 function getActivityItems(messages: Message[]): ActivityItem[] {
@@ -366,23 +397,115 @@ function getParallelTaskStatus(result: SingleResult): { label: string; color: "s
 	return { label: "已完成", color: "success" };
 }
 
+function resolveSecondsToMs(seconds: number | undefined, label: string): number | undefined {
+	if (seconds === undefined) return undefined;
+	if (!Number.isFinite(seconds) || seconds <= 0) {
+		throw new Error(`Invalid ${label}: must be a positive finite number`);
+	}
+	const milliseconds = seconds * 1000;
+	if (milliseconds > MAX_TIMEOUT_MS) {
+		throw new Error(`Invalid ${label}: maximum is ${MAX_TIMEOUT_MS / 1000} seconds`);
+	}
+	return milliseconds;
+}
+
+type AdmissionRelease = () => void;
+
+interface AdmissionWaiter {
+	resolve: (release: AdmissionRelease) => void;
+	reject: (error: Error) => void;
+	signal?: AbortSignal;
+	onAbort?: () => void;
+	cancelled: boolean;
+}
+
+class SubagentAdmission {
+	private active = 0;
+	private readonly waiters: AdmissionWaiter[] = [];
+
+	constructor(private readonly limit: number) {}
+
+	acquire(signal?: AbortSignal): Promise<AdmissionRelease> {
+		return new Promise((resolve, reject) => {
+			const waiter: AdmissionWaiter = { resolve, reject, signal, cancelled: false };
+			const cancel = () => {
+				if (waiter.cancelled) return;
+				waiter.cancelled = true;
+				const index = this.waiters.indexOf(waiter);
+				if (index >= 0) this.waiters.splice(index, 1);
+				waiter.signal?.removeEventListener("abort", cancel);
+				reject(new Error("Subagent admission wait aborted"));
+			};
+			waiter.onAbort = cancel;
+
+			if (signal?.aborted) {
+				cancel();
+				return;
+			}
+
+			if (this.active < this.limit) this.grant(waiter);
+			else {
+				this.waiters.push(waiter);
+				signal?.addEventListener("abort", cancel, { once: true });
+			}
+		});
+	}
+
+	private grant(waiter: AdmissionWaiter): void {
+		if (waiter.cancelled) return;
+		waiter.signal?.removeEventListener("abort", waiter.onAbort!);
+		this.active++;
+		let released = false;
+		waiter.resolve(() => {
+			if (released) return;
+			released = true;
+			this.active--;
+			this.drain();
+		});
+	}
+
+	private drain(): void {
+		while (this.active < this.limit && this.waiters.length > 0) {
+			const waiter = this.waiters.shift()!;
+			if (waiter.cancelled) continue;
+			this.grant(waiter);
+		}
+	}
+}
+
+// 同一 Pi 进程内的所有 subagent 调用共享 admission，避免多个父工具并行时突破并发上限。
+const subagentAdmission = new SubagentAdmission(MAX_CONCURRENCY);
+
 async function mapWithConcurrencyLimit<TIn, TOut>(
 	items: TIn[],
 	concurrency: number,
 	fn: (item: TIn, index: number) => Promise<TOut>,
+	onError?: (error: unknown, index: number) => void,
 ): Promise<TOut[]> {
 	if (items.length === 0) return [];
 	const limit = Math.max(1, Math.min(concurrency, items.length));
 	const results: TOut[] = new Array(items.length);
 	let nextIndex = 0;
+	let firstError: unknown;
+	let hasError = false;
 	const workers = new Array(limit).fill(null).map(async () => {
-		while (true) {
+		while (!hasError) {
 			const current = nextIndex++;
 			if (current >= items.length) return;
-			results[current] = await fn(items[current], current);
+			try {
+				results[current] = await fn(items[current], current);
+			} catch (error) {
+				if (!hasError) {
+					hasError = true;
+					firstError = error;
+					onError?.(error, current);
+				}
+				return;
+			}
 		}
 	});
 	await Promise.all(workers);
+	if (hasError) throw firstError;
 	return results;
 }
 
@@ -521,11 +644,13 @@ async function runSingleAgent(
 	agentName: string,
 	task: string,
 	cwd: string | undefined,
+	idleTimeoutSeconds: number | undefined,
 	step: number | undefined,
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 ): Promise<SingleResult> {
+	const idleTimeoutMs = resolveSecondsToMs(idleTimeoutSeconds, "idleTimeoutSeconds");
 	const agent = agents.find((a) => a.name === agentName);
 
 	if (!agent) {
@@ -554,6 +679,11 @@ async function runSingleAgent(
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
+	let releaseAdmission: AdmissionRelease | undefined;
+	const taskController = new AbortController();
+	let parentAbortHandler: (() => void) | undefined;
+	let wasAborted = false;
+	let wasIdleTimedOut = false;
 
 	const currentResult: SingleResult = {
 		agent: agentName,
@@ -582,7 +712,10 @@ async function runSingleAgent(
 	let messageSequence = 0;
 
 	const updateLiveActivity = (key: string, kind: "tool" | "text", value: unknown, toolName?: string) => {
-		const text = kind === "tool" ? getToolActivity(toolName || key.slice(5), (value || {}) as Record<string, any>) : shortenActivityText(value);
+		const text =
+			kind === "tool"
+				? getToolActivity(toolName || key.slice(5), (value || {}) as Record<string, any>)
+				: normalizeActivityText(value);
 		if (!text) return;
 
 		const existingIndex = liveActivities.findIndex((item) => item.key === key);
@@ -606,7 +739,15 @@ async function runSingleAgent(
 		}
 
 		args.push(`Task: ${task}`);
-		let wasAborted = false;
+		if (signal) {
+			parentAbortHandler = () => taskController.abort();
+			if (signal.aborted) parentAbortHandler();
+			else signal.addEventListener("abort", parentAbortHandler, { once: true });
+		}
+		releaseAdmission = await subagentAdmission.acquire(taskController.signal);
+		if (taskController.signal.aborted) {
+			throw new Error("Subagent was aborted before process start");
+		}
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
@@ -622,11 +763,14 @@ async function runSingleAgent(
 			let closed = false;
 			let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
 			let abortHandler: (() => void) | undefined;
+			let idleTimeoutHandle: ReturnType<typeof setInterval> | undefined;
+			let lastActivityAt = Date.now();
 			const decoder = new StringDecoder("utf8");
 
 			const cleanup = () => {
 				if (forceKillTimer) clearTimeout(forceKillTimer);
-				if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
+				if (idleTimeoutHandle) clearInterval(idleTimeoutHandle);
+				if (taskController.signal && abortHandler) taskController.signal.removeEventListener("abort", abortHandler);
 			};
 
 			const processLine = (line: string) => {
@@ -702,6 +846,7 @@ async function runSingleAgent(
 			};
 
 			proc.stdout.on("data", (data) => {
+				lastActivityAt = Date.now();
 				buffer += decoder.write(data);
 				const lines = buffer.split("\n");
 				buffer = lines.pop() || "";
@@ -709,6 +854,7 @@ async function runSingleAgent(
 			});
 
 			proc.stderr.on("data", (data) => {
+				lastActivityAt = Date.now();
 				currentResult.stderr = appendCappedText(currentResult.stderr, data.toString(), MAX_STDERR_BYTES);
 			});
 
@@ -748,17 +894,35 @@ async function runSingleAgent(
 					if (!closed) terminateChildProcess(proc, "SIGKILL");
 				}, 5000);
 			};
-			if (signal) {
-				if (signal.aborted) abortHandler();
-				else signal.addEventListener("abort", abortHandler, { once: true });
+			if (taskController.signal) {
+				if (taskController.signal.aborted) abortHandler();
+				else taskController.signal.addEventListener("abort", abortHandler, { once: true });
+			}
+			if (idleTimeoutMs !== undefined && !closed) {
+				// 轮询而非每次活动都重排定时器：流式输出期间活动极密集，重排的抖动和开销都更大。
+				// 计时从进程启动开始，排队等待不计入空闲。
+				const idleCheckIntervalMs = Math.max(250, Math.min(1000, Math.floor(idleTimeoutMs / 4)));
+				idleTimeoutHandle = setInterval(() => {
+					if (closed || Date.now() - lastActivityAt < idleTimeoutMs) return;
+					wasIdleTimedOut = true;
+					taskController.abort();
+				}, idleCheckIntervalMs);
+				idleTimeoutHandle.unref();
 			}
 		});
 
 		currentResult.exitCode = exitCode;
 		if (exitCode !== 0 && !currentResult.stopReason) currentResult.stopReason = "error";
+		if (wasIdleTimedOut) throw new Error(`Subagent idle for ${idleTimeoutSeconds} seconds; terminated`);
 		if (wasAborted) throw new Error("Subagent was aborted");
 		return currentResult;
+	} catch (error) {
+		if (wasIdleTimedOut) throw new Error(`Subagent idle for ${idleTimeoutSeconds} seconds; terminated`);
+		if (taskController.signal.aborted) throw new Error("Subagent was aborted");
+		throw error;
 	} finally {
+		if (signal && parentAbortHandler) signal.removeEventListener("abort", parentAbortHandler);
+		if (releaseAdmission) releaseAdmission();
 		if (tmpPromptPath)
 			try {
 				fs.unlinkSync(tmpPromptPath);
@@ -778,12 +942,18 @@ const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	idleTimeoutSeconds: Type.Optional(
+		Type.Number({ description: "Kill the task if it emits no output for this many seconds; resets on every output event" }),
+	),
 });
 
 const ChainItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	idleTimeoutSeconds: Type.Optional(
+		Type.Number({ description: "Kill the task if it emits no output for this many seconds; resets on every output event" }),
+	),
 });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
@@ -801,10 +971,57 @@ const SubagentParams = Type.Object({
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	idleTimeoutSeconds: Type.Optional(
+		Type.Number({ description: "Kill the task if it emits no output for this many seconds; resets on every output event" }),
+	),
 });
+
+const BackgroundTaskParams = Type.Object({
+	action: StringEnum(["start", "list", "status", "result", "logs", "kill"] as const),
+	agent: Type.Optional(Type.String({ description: "Agent name for start" })),
+	task: Type.Optional(Type.String({ description: "Task prompt for start" })),
+	taskId: Type.Optional(Type.String({ description: "Background task id for status/result/logs/kill" })),
+	cwd: Type.Optional(Type.String({ description: "Working directory for start" })),
+	idleTimeoutSeconds: Type.Optional(
+		Type.Number({ description: "Kill the task if it writes no output for this many seconds; resets on every output event" }),
+	),
+	notifyOnCompletion: Type.Optional(Type.Boolean({ description: "Send a completion notification. Default: true" })),
+	triggerOnCompletion: Type.Optional(Type.Boolean({ description: "Wake a follow-up turn on completion. Default: false" })),
+	agentScope: Type.Optional(AgentScopeSchema),
+	confirmProjectAgents: Type.Optional(Type.Boolean({ description: "Prompt before running project-local agents. Default: true" })),
+});
+
+function formatBackgroundTask(task: BackgroundTaskRecord): string {
+	const finished = task.finishedAt ? ` finished=${new Date(task.finishedAt).toISOString()}` : "";
+	const pid = task.runnerPid ? ` pid=${task.runnerPid}` : "";
+	return `${task.id} [${task.status}] ${task.agent}${pid}${finished}`;
+}
 
 export default function (pi: ExtensionAPI) {
 	void sweepStaleSubagentTempDirs();
+	const registry = new BackgroundTaskRegistry({
+		rootDir: BACKGROUND_TASK_ROOT,
+		runnerPath: path.join(path.dirname(fileURLToPath(import.meta.url)), "background-runner.mjs"),
+		maxConcurrentTasks: MAX_CONCURRENCY,
+		onTerminal: (task) => {
+			if (!task.notifyOnCompletion) return;
+			const detail = task.status === "completed" ? "Completed" : task.errorMessage || task.status;
+			pi.sendMessage(
+				{
+					customType: "subagent-background",
+					content: `Background subagent ${task.agent} ${detail}. Task id: ${task.id}`,
+					display: true,
+				},
+				{
+					deliverAs: task.triggerOnCompletion ? "followUp" : "nextTurn",
+					triggerTurn: task.triggerOnCompletion,
+				},
+			);
+		},
+	});
+	pi.on("session_start", async () => {
+		await registry.reconcile();
+	});
 
 	// Output files stay readable for the whole session, so only reclaim them on real exit.
 	// reload/resume/new/fork may continue using this session, where the path is still in context.
@@ -817,14 +1034,49 @@ export default function (pi: ExtensionAPI) {
 		);
 	});
 
+	pi.registerCommand("subagent:list", {
+		description: "列出可用 subagent，并把清单注入会话上下文",
+		handler: async (_args, ctx) => {
+			const { agents, projectAgentsDir } = discoverAgents(ctx.cwd, "both");
+			const lines = agents.length === 0
+				? ["当前没有可用的 subagent。"]
+				: [`可用 subagent（${agents.length} 个）：`, ...agents.map((a) => `- ${formatAgentLine(a)}`)];
+			if (projectAgentsDir) lines.push(`项目 agent 目录：${projectAgentsDir}`);
+			const report = lines.join("\n");
+			// 命令返回值会被 pi 丢弃，必须显式输出；无 UI 模式退回 stderr，避免污染 JSON 事件流
+			if (ctx.hasUI) ctx.ui.notify(report, "info");
+			else console.error(report);
+			// 工具描述只在扩展加载时生成，这里给模型补一份实时清单
+			pi.sendMessage(
+				{ customType: "subagent-list", content: report, display: false },
+				{ deliverAs: "nextTurn" },
+			);
+		},
+	});
+
+	pi.registerCommand("subagent:jobs", {
+		description: "查看后台 subagent 任务",
+		handler: async (_args, ctx) => {
+			const tasks = await registry.list();
+			const report = tasks.length === 0
+				? "当前没有后台 subagent 任务。"
+				: ["后台 subagent 任务：", ...tasks.map(formatBackgroundTask)].join("\n");
+			if (ctx.hasUI) ctx.ui.notify(report, "info");
+			else console.error(report);
+		},
+	});
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			"Use idleTimeoutSeconds to kill only tasks that stop emitting output (the clock resets on every output event).",
+			"Parallel tasks are cancelled together after the first failure.",
 			`Default agent scope is "both": combines ${CONFIG_DIR_NAME}/agents with ${path.join(getAgentDir(), "agents")}.`,
 			"Project agents override user agents with the same name.",
+			describeAgents(discoverAgents(process.cwd(), "both").agents),
 		].join(" "),
 		parameters: SubagentParams,
 
@@ -920,6 +1172,7 @@ export default function (pi: ExtensionAPI) {
 						step.agent,
 						taskWithContext,
 						step.cwd,
+						step.idleTimeoutSeconds,
 						i + 1,
 						signal,
 						chainUpdate,
@@ -976,29 +1229,51 @@ export default function (pi: ExtensionAPI) {
 					}
 				};
 
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-					const result = await runSingleAgent(
-						ctx.cwd,
-						dispatchDefaults,
-						agents,
-						t.agent,
-						t.task,
-						t.cwd,
-						undefined,
-						signal,
-						// Per-task update callback
-						(partial) => {
-							if (partial.details?.results[0]) {
-								allResults[index] = partial.details.results[0];
-								emitParallelUpdate();
+				const parallelController = new AbortController();
+				const parentAbortHandler = () => parallelController.abort();
+				if (signal) {
+					if (signal.aborted) parentAbortHandler();
+					else signal.addEventListener("abort", parentAbortHandler, { once: true });
+				}
+
+				let results: SingleResult[];
+				try {
+					results = await mapWithConcurrencyLimit(
+						params.tasks,
+						MAX_CONCURRENCY,
+						async (t, index) => {
+							const result = await runSingleAgent(
+								ctx.cwd,
+								dispatchDefaults,
+								agents,
+								t.agent,
+								t.task,
+								t.cwd,
+								t.idleTimeoutSeconds,
+								undefined,
+								parallelController.signal,
+								// Per-task update callback
+								(partial) => {
+									if (partial.details?.results[0]) {
+										allResults[index] = partial.details.results[0];
+										emitParallelUpdate();
+									}
+								},
+								makeDetails("parallel"),
+							);
+							allResults[index] = result;
+							emitParallelUpdate();
+							if (isFailedResult(result)) {
+								const output = await getResultOutputPreview(result, Math.max(1024, Math.floor(PER_TASK_OUTPUT_CAP / allResults.length)));
+								throw new Error(`Agent ${result.agent} failed: ${output}`);
 							}
+							return result;
 						},
-						makeDetails("parallel"),
+						() => parallelController.abort(),
 					);
-					allResults[index] = result;
-					emitParallelUpdate();
-					return result;
-				});
+				} finally {
+					if (signal) signal.removeEventListener("abort", parentAbortHandler);
+				}
 
 				const successCount = results.filter((r) => !isFailedResult(r)).length;
 				const perTaskOutputCap = Math.max(1024, Math.floor(PER_TASK_OUTPUT_CAP / results.length));
@@ -1034,6 +1309,7 @@ export default function (pi: ExtensionAPI) {
 					params.agent,
 					params.task,
 					params.cwd,
+					params.idleTimeoutSeconds,
 					undefined,
 					signal,
 					onUpdate,
@@ -1272,7 +1548,7 @@ export default function (pi: ExtensionAPI) {
 					? `${successCount + failCount}/${details.results.length} done, ${running} running`
 					: `${successCount}/${details.results.length} tasks`;
 
-				if (expanded && !isRunning) {
+				if (expanded) {
 					const container = new Container();
 					container.addChild(
 						new Text(
@@ -1283,14 +1559,34 @@ export default function (pi: ExtensionAPI) {
 					);
 
 					for (const r of details.results) {
+						const taskStatus = getParallelTaskStatus(r);
+						const isTaskRunning = r.exitCode === -1;
 						const displayItems = getDisplayItems(r.messages);
 						const finalOutput = getFinalOutput(r.messages);
 
 						container.addChild(new Spacer(1));
 						container.addChild(
-							new Text(`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)}`, 0, 0),
+							new Text(
+								`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${theme.fg(taskStatus.color, `[${taskStatus.label}]`)}`,
+								0,
+								0,
+							),
 						);
 						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+
+						// 运行中的任务只展示最近活动，避免把尚未完成的中间状态
+						// 当成最终输出，同时让展开视图能持续反映当前进度。
+						if (isTaskRunning) {
+							const activityLines = getParallelActivityLines(r);
+							if (activityLines.length === 0) {
+								container.addChild(new Text(theme.fg("muted", "(waiting for activity...)"), 0, 0));
+							} else {
+								for (const activity of activityLines) {
+									container.addChild(new Text(theme.fg("muted", `  ${activity}`), 0, 0));
+								}
+							}
+							continue;
+						}
 
 						// Show tool calls
 						for (const item of displayItems) {
@@ -1323,7 +1619,7 @@ export default function (pi: ExtensionAPI) {
 					return container;
 				}
 
-				// 默认视图只保留每个任务的状态和最近活动，避免并行任务把终端铺满。
+				// 默认视图只保留每个任务的一行状态，避免并行任务把终端铺满。
 				let text = `${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
 				for (const r of details.results) {
 					const taskStatus = getParallelTaskStatus(r);
@@ -1332,13 +1628,7 @@ export default function (pi: ExtensionAPI) {
 						`\n${theme.fg("accent", r.agent)}` +
 						` ${theme.fg(taskStatus.color, `[${taskStatus.label}]`)} ` +
 						theme.fg("dim", taskName);
-
-					if (r.exitCode === -1) {
-						for (const activity of getParallelActivityLines(r)) {
-							text += `\n  ${theme.fg("muted", activity)}`;
-						}
 					}
-				}
 				if (!isRunning) {
 					const usageStr = formatUsageStats(aggregateUsage(details.results));
 					if (usageStr) text += `\n${theme.fg("dim", `Total: ${usageStr}`)}`;
@@ -1349,6 +1639,99 @@ export default function (pi: ExtensionAPI) {
 
 			const text = result.content[0];
 			return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_background",
+		label: "Background Subagent",
+		description: "Start and manage persistent background subagent tasks. Use start to return immediately, then query status/result/logs or kill by taskId.",
+		parameters: BackgroundTaskParams,
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (params.action === "list") {
+				const tasks = await registry.list();
+				return {
+					content: [{ type: "text", text: tasks.map(formatBackgroundTask).join("\n") || "No background subagent tasks." }],
+					details: undefined,
+				};
+			}
+
+			if (params.action !== "start") {
+				if (!params.taskId) throw new Error(`taskId is required for ${params.action}.`);
+				if (params.action === "status") {
+					const task = await registry.get(params.taskId);
+					return { content: [{ type: "text", text: JSON.stringify(task, null, 2) }], details: task };
+				}
+				if (params.action === "result") {
+					const result = await registry.getResult(params.taskId);
+					return { content: [{ type: "text", text: result.content }], details: result.task };
+				}
+				if (params.action === "logs") {
+					const result = await registry.getLogs(params.taskId);
+					return { content: [{ type: "text", text: result.content }], details: result.task };
+				}
+				const task = await registry.kill(params.taskId);
+				return { content: [{ type: "text", text: JSON.stringify(task, null, 2) }], details: task };
+			}
+
+			if (!params.agent || !params.task) throw new Error("agent and task are required for start.");
+			if (getSubagentDepth() >= MAX_SUBAGENT_DEPTH) {
+				throw new Error(`Subagent nesting depth exceeded (max ${MAX_SUBAGENT_DEPTH}).`);
+			}
+			const agentScope: AgentScope = params.agentScope ?? "both";
+			const projectAgentsAllowed = ctx.isProjectTrusted() || ctx.hasUI;
+			let discoveryScope = agentScope;
+			if (!projectAgentsAllowed && agentScope === "both") discoveryScope = "user";
+			const discovery = discoverAgents(ctx.cwd, discoveryScope);
+			const agents = !projectAgentsAllowed && agentScope === "project" ? [] : discovery.agents;
+			const agent = agents.find((candidate) => candidate.name === params.agent);
+			if (!agent) throw new Error(`Unknown agent: "${params.agent}".`);
+
+			if (
+				agent.source === "project" &&
+				params.confirmProjectAgents !== false &&
+				ctx.hasUI &&
+				!ctx.isProjectTrusted()
+			) {
+				const ok = await ctx.ui.confirm(
+					"Run project-local agent?",
+					`Agent: ${agent.name}\nSource: ${discovery.projectAgentsDir ?? "(unknown)"}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
+				);
+				if (!ok) throw new Error("Project-local agent was not approved.");
+			}
+
+			const dispatchDefaults: DispatchDefaults = {
+				model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+				thinkingLevel: ctx.thinkingLevel,
+			};
+			const createInvocation = (systemPromptPath?: string) => {
+				const args: string[] = ["--mode", "json", "-p", "--no-session", "--exclude-tools", "subagent,subagent_background"];
+				const model = agent.model ?? dispatchDefaults.model;
+				if (model) args.push("--model", model);
+				if (!agent.model && dispatchDefaults.thinkingLevel) args.push("--thinking", dispatchDefaults.thinkingLevel);
+				if (agent.toolsSpecified) args.push("--tools", agent.tools?.join(",") ?? "");
+				if (systemPromptPath) args.push("--append-system-prompt", systemPromptPath);
+				args.push(`Task: ${params.task}`);
+				return getPiInvocation(args);
+			};
+			const task = await registry.start({
+				agent: agent.name,
+				agentSource: agent.source,
+				task: params.task,
+				cwd: resolveAgentCwd(ctx.cwd, params.cwd),
+				model: agent.model ?? dispatchDefaults.model,
+				sessionId: ctx.sessionManager.getSessionId(),
+				idleTimeoutSeconds: params.idleTimeoutSeconds,
+				notifyOnCompletion: params.notifyOnCompletion ?? true,
+				triggerOnCompletion: params.triggerOnCompletion ?? false,
+				systemPrompt: agent.systemPrompt,
+				createInvocation,
+			});
+			return {
+				content: [{ type: "text", text: `Background subagent started: ${formatBackgroundTask(task)}` }],
+				details: task,
+			};
 		},
 	});
 }
