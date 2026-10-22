@@ -1,20 +1,20 @@
-# CSS structure notes
+# CSS 结构笔记
 
-This reference distills the article "Moving away from Tailwind, and learning to structure my CSS" into a practical set of rules.
+本文把《Moving away from Tailwind, and learning to structure my CSS》一文提炼成一组可操作的规则。
 
-## Core idea
+## 核心思想
 
-Do not treat moving away from Tailwind as a rejection of constraints. Keep the useful structure:
+离开 Tailwind 不等于抛弃约束。保留有用的结构：
 
 - reset
-- design tokens
-- component isolation
-- limited utilities
-- layout-owned spacing
+- 设计 token
+- 组件隔离
+- 受限的工具类
+- 由布局拥有的间距
 
-The goal is semantic HTML plus CSS that stays easy to reason about.
+目标是语义化 HTML 加上始终容易推理的 CSS。
 
-## Recommended structure
+## 推荐结构
 
 ```txt
 styles/
@@ -35,19 +35,19 @@ styles/
     article-list.css
 ```
 
-## Practical rules
+## 实操规则
 
 ### 1. Reset
 
-- Keep a stable reset or preflight layer.
-- Use it to flatten browser differences, not to redefine the whole design system.
+- 保留一层稳定的 reset 或 preflight。
+- 用它抹平浏览器差异，而不是重新定义整个设计系统。
 
-### 2. Tokens
+### 2. Token
 
-- Centralize repeated values as CSS variables.
-- Colors, font sizes, line heights, and spacing should not be scattered inline across files.
+- 把重复的值集中为 CSS 变量。
+- 颜色、字号、行高和间距不应以内联形式散落在各个文件里。
 
-Example:
+示例：
 
 ```css
 :root {
@@ -65,13 +65,13 @@ Example:
 }
 ```
 
-### 3. Components
+### 3. 组件
 
-- Give each component a root class.
-- Keep component styles self-contained.
-- Avoid rules that assume another component's internal DOM.
+- 每个组件给一个根类。
+- 组件样式自包含。
+- 避免假定另一个组件内部 DOM 的规则。
 
-Example:
+示例：
 
 ```css
 .card {
@@ -86,10 +86,10 @@ Example:
 
 ### 4. Base
 
-- Keep global element selectors minimal.
-- Only put rules here if they are truly valid across the whole site.
+- 全局元素选择器保持最少。
+- 只有真正全站有效的规则才放这里。
 
-Example:
+示例：
 
 ```css
 html {
@@ -105,12 +105,12 @@ a {
 }
 ```
 
-### 5. Utilities
+### 5. 工具类
 
-- Keep only a very small set of generic helpers.
-- If a class carries product meaning, it belongs in a component or layout layer instead.
+- 只保留极少量通用辅助类。
+- 一个类若带有产品含义，它应该属于组件层或布局层。
 
-Example:
+示例：
 
 ```css
 .sr-only {
@@ -121,13 +121,13 @@ Example:
 }
 ```
 
-### 6. Spacing
+### 6. 间距
 
-- Let outer layout control vertical rhythm between blocks.
-- Let components control only their own internal spacing.
-- Do not patch spacing with one-off margins everywhere.
+- 让外层布局控制区块之间的纵向节奏。
+- 组件只控制自己内部的间距。
+- 不要到处用一次性 margin 修补间距。
 
-Example:
+示例：
 
 ```css
 .section > * + * {
@@ -135,12 +135,12 @@ Example:
 }
 ```
 
-### 7. Layout
+### 7. 布局
 
-- Separate layout primitives from business components.
-- Reuse container, stack, cluster, and grid patterns.
+- 把布局原语与业务组件分开。
+- 复用 container、stack、cluster、grid 这些模式。
 
-Example:
+示例：
 
 ```css
 .section {
@@ -155,18 +155,18 @@ Example:
 }
 ```
 
-### 8. Responsive behavior
+### 8. 响应式
 
-- Prefer intrinsic layouts first.
-- Use media queries as a complement, not as the default design primitive.
+- 优先固有布局。
+- 媒体查询是补充手段，不是默认的设计原语。
 
-### 9. Build setup
+### 9. 构建配置
 
-- Keep development workflow simple.
-- Use native CSS features when possible.
-- Bundle for production if needed, but do not force a heavy CSS pipeline just to keep styles organized.
+- 开发流程保持简单。
+- 尽量使用原生 CSS 特性。
+- 需要时为生产环境打包，但不要为了组织样式就强上一套重型 CSS 流水线。
 
-Example:
+示例：
 
 ```css
 @import "./reset.css";
@@ -178,13 +178,12 @@ Example:
 @import "./components/card.css";
 ```
 
-## Migration checklist
+## 迁移清单
 
-- Keep or replace reset first.
-- Extract repeated values into tokens.
-- Group handwritten CSS by component boundaries.
-- Move cross-section spacing rules into layout classes.
-- Shrink utility usage to a deliberate small set.
-- Replace breakpoint-heavy layouts with grid/flex patterns where possible.
-- Stop growing a mixed Tailwind + plain CSS system unless the mix is intentionally temporary.
-
+- 先保留或替换 reset。
+- 把重复值抽成 token。
+- 按组件边界归组手写 CSS。
+- 把跨区块的间距规则移入布局类。
+- 把工具类用量收缩到一组刻意选定的小集合。
+- 尽可能用 grid/flex 模式替换依赖大量断点的布局。
+- 除非混用是有意的过渡，否则停止扩大 Tailwind + 原生 CSS 的混合系统。

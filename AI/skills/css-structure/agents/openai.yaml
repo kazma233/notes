@@ -1,4 +1,4 @@
 interface:
-  display_name: "CSS Structure"
-  short_description: "Organize plain CSS with tokens, layouts, components, and minimal utilities"
-  default_prompt: "Use CSS Structure to organize or migrate frontend styles with semantic HTML and constrained plain CSS."
+  display_name: "CSS 结构"
+  short_description: "用 token、布局、组件和极少量工具类组织原生 CSS"
+  default_prompt: "使用 CSS 结构技能，以语义化 HTML 和受约束的原生 CSS 组织或迁移前端样式。"

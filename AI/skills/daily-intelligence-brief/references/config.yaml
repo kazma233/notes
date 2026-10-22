@@ -36,7 +36,7 @@ rss_sources:
     url: https://noted.lol/rss
   - name: PyCoder's Weekly
     url: https://pycoders.com/feed/JX9f9PeH
-  - name: 定义
+  - name: dingyi
     url: https://quaily.com/dingyi/feed/atom
   - name: Just Go Idea
     url: https://quaily.com/justgoidea/feed/atom
@@ -104,8 +104,16 @@ site_sources:
     max_discovery_pages: 20
     max_articles: 50
   - name: thepaper
-    url: https://www.thepaper.cn//
+    url: https://www.thepaper.cn/
     max_discovery_pages: 20
+    max_articles: 50
+  - name: programmingdigest
+    url: https://programmingdigest.net/newsletters
+    max_discovery_pages: 1
+    max_articles: 50
+  - name: producthunt
+    url: https://www.producthunt.com/newsletters
+    max_discovery_pages: 1
     max_articles: 50
 
 # topic 只需给出长期关注方向。采集时会自行推导当日的中英文探索词和子议题。
